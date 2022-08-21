@@ -17,15 +17,21 @@ import * as nn from "./nn";
 import {HeatMap, reduceMatrix} from "./heatmap";
 import {
   State,
+  Loss,
+  Generalization,
   datasets,
   regDatasets,
   activations,
   problems,
+  losses,
+  optimizers,
+  generalizations,
+  secondLabels,
   regularizations,
   getKeyFromValue,
   Problem
 } from "./state";
-import {Example2D, shuffle} from "./dataset";
+import {Example2D, shuffle, filterByMargin, addLabels, splitData} from "./dataset";
 import {AppendingLineChart} from "./linechart";
 import * as d3 from 'd3';
 
@@ -52,6 +58,10 @@ const BIAS_SIZE = 5;
 const NUM_SAMPLES_CLASSIFY = 500;
 const NUM_SAMPLES_REGRESS = 1200;
 const DENSITY = 100;
+const MAX_NUM_HIDDEN_LAYERS = 16;
+const MAX_NUM_NEURONS = 128;
+const MAX_NUM_DISPLAY_NEURONS = 10;
+const NEGATIVE_EPSILON = -0.0001;
 
 enum HoverType {
   BIAS, WEIGHT
@@ -83,6 +93,10 @@ let HIDABLE_CONTROLS = [
   ["Regularization", "regularization"],
   ["Regularization rate", "regularizationRate"],
   ["Problem type", "problem"],
+  ["Loss type", "loss"],
+  ["Optimizer type", "optimizer"],
+  ["Generalization type", "generalization"],
+  ["SecondLabel type", "secondLabel"],
   ["Which dataset", "dataset"],
   ["Ratio train data", "percTrainData"],
   ["Noise level", "noise"],
@@ -155,7 +169,13 @@ let selectedNodeId: string = null;
 // Plot the heatmap.
 let xDomain: [number, number] = [-6, 6];
 let heatMap =
-    new HeatMap(300, DENSITY, xDomain, xDomain, d3.select("#heatmap"),
+    new HeatMap(300, DENSITY, xDomain, xDomain, d3.select("#heatmap"), 0,
+        {showAxes: true});
+let heatMap2 =
+    new HeatMap(300, DENSITY, xDomain, xDomain, d3.select("#heatmap2"), 1,
+        {showAxes: true});
+let heatMapOverlap =
+    new HeatMap(300, DENSITY, xDomain, xDomain, d3.select("#heatmap_overlap"), 0,
         {showAxes: true});
 let linkWidthScale = d3.scale.linear()
   .domain([0, 5])
@@ -168,6 +188,7 @@ let colorScale = d3.scale.linear<string, number>()
 let iter = 0;
 let trainData: Example2D[] = [];
 let testData: Example2D[] = [];
+let allData: Example2D[] = [];
 let network: nn.Node[][] = null;
 let lossTrain = 0;
 let lossTest = 0;
@@ -245,10 +266,13 @@ function makeGUI() {
     .classed("selected", true);
 
   d3.select("#add-layers").on("click", () => {
-    if (state.numHiddenLayers >= 6) {
+    if (state.numHiddenLayers >= MAX_NUM_HIDDEN_LAYERS) {
       return;
     }
-    state.networkShape[state.numHiddenLayers] = 2;
+    if (state.splitLayerIndex == state.numHiddenLayers) {
+      state.splitLayerIndex++;
+    }
+    state.networkShape[state.numHiddenLayers] = 8;
     state.numHiddenLayers++;
     parametersChanged = true;
     reset();
@@ -257,6 +281,9 @@ function makeGUI() {
   d3.select("#remove-layers").on("click", () => {
     if (state.numHiddenLayers <= 0) {
       return;
+    }
+    if (state.splitLayerIndex == state.numHiddenLayers) {
+      state.splitLayerIndex--;
     }
     state.numHiddenLayers--;
     state.networkShape.splice(state.numHiddenLayers);
@@ -269,9 +296,19 @@ function makeGUI() {
     state.serialize();
     userHasInteracted();
     heatMap.updateTestPoints(state.showTestData ? testData : []);
+    heatMap2.updateTestPoints(state.showTestData ? testData : []);
+    heatMapOverlap.updateTestPoints(state.showTestData ? testData : []);
   });
   // Check/uncheck the checkbox according to the current state.
   showTestData.property("checked", state.showTestData);
+
+  let secondLabelMargin = d3.select("#second-label-margin").on("change", function() {
+    state.secondLabelMargin = this.checked;
+    updateData();
+    parametersChanged = true;
+  });
+  // Check/uncheck the checkbox according to the current state.
+  secondLabelMargin.property("checked", state.secondLabelMargin);
 
   let discretize = d3.select("#discretize").on("change", function() {
     state.discretize = this.checked;
@@ -362,6 +399,39 @@ function makeGUI() {
   });
   problem.property("value", getKeyFromValue(problems, state.problem));
 
+  let loss = d3.select("#loss").on("change", function() {
+    state.loss = losses[this.value];
+    generateData();
+    drawDatasetThumbnails();
+    parametersChanged = true;
+    reset();
+  });
+  loss.property("value", getKeyFromValue(loss, state.loss));
+
+  let optimizer = d3.select("#optimizer").on("change", function() {
+    state.optimizer = optimizers[this.value];
+    parametersChanged = true;
+    reset();
+  });
+  optimizer.property("value", getKeyFromValue(optimizers, state.optimizer));
+
+  let generalization = d3.select("#generalization").on("change", function() {
+    state.generalization = generalizations[this.value];
+    updateData();
+    drawDatasetThumbnails();
+    parametersChanged = true;
+  });
+  generalization.property("value", getKeyFromValue(generalizations, state.generalization));
+
+  let secondLabel = d3.select("#secondLabel").on("change", function() {
+    state.secondLabel = secondLabels[this.value];
+    generateData();
+    drawDatasetThumbnails();
+    parametersChanged = true;
+    reset();
+  });
+  secondLabel.property("value", getKeyFromValue(secondLabels, state.secondLabel));
+
   // Add scale to the gradient color map.
   let x = d3.scale.linear().domain([-1, 1]).range([0, 144]);
   let xAxis = d3.svg.axis()
@@ -418,6 +488,48 @@ function updateWeightsUI(network: nn.Node[][], container) {
       }
     }
   }
+}
+
+function getOverlapPoint(p1: boolean, p2: boolean): number {
+  if (p1 && p2) {
+    return 1;
+  } else if (p1 || p2) {
+    return NEGATIVE_EPSILON;
+  } else {
+    return -1;
+  }
+}
+
+function getOverlapLabel(v1: number, v2: number, id: number): number {
+  let p1 = v1 > 0;
+  let p2 = v2 > 0;
+  if (id === Generalization.OOD_PP) {
+    return getOverlapPoint(p1, p2);
+  } else if (id === Generalization.OOD_PN) {
+    return getOverlapPoint(p1, !p2);
+  } else if (id === Generalization.OOD_NP) {
+    return getOverlapPoint(!p1, p2);
+  } else if (id === Generalization.OOD_NN) {
+    return getOverlapPoint(!p1, !p2);
+  } else {
+    return getOverlapPoint(p1, p2);
+  }
+}
+
+function getOverlap(data1: number[][], data2: number[][]): number[][] {
+  let dx = data1[0].length;
+  let dy = data1.length;
+  let id = state.generalization;
+  let overlap: number[][] = new Array(dy);
+  for (let i = 0; i < dy; i++) {
+    let row : number[] = new Array(dx);
+    for (let j = 0; j < dx; j++) {
+      let overlapLabel = getOverlapLabel(data1[i][j], data2[i][j], id);
+      row[j] = overlapLabel;
+    }
+    overlap[i] = row;
+  }
+  return overlap;
 }
 
 function drawNode(cx: number, cy: number, nodeId: string, isInput: boolean,
@@ -508,6 +620,7 @@ function drawNode(cx: number, cy: number, nodeId: string, isInput: boolean,
       nodeGroup.classed("hovered", true);
       updateDecisionBoundary(network, false);
       heatMap.updateBackground(boundary[nodeId], state.discretize);
+      heatMap2.updateBackground(boundary[nodeId], state.discretize);
     })
     .on("mouseleave", function() {
       selectedNodeId = null;
@@ -515,6 +628,8 @@ function drawNode(cx: number, cy: number, nodeId: string, isInput: boolean,
       nodeGroup.classed("hovered", false);
       updateDecisionBoundary(network, false);
       heatMap.updateBackground(boundary[nn.getOutputNode(network).id],
+          state.discretize);
+      heatMap2.updateBackground(boundary[nn.getOutputNode2(network).id],
           state.discretize);
     });
   if (isInput) {
@@ -529,7 +644,7 @@ function drawNode(cx: number, cy: number, nodeId: string, isInput: boolean,
     div.classed(activeOrNotClass, true);
   }
   let nodeHeatMap = new HeatMap(RECT_SIZE, DENSITY / 10, xDomain,
-      xDomain, div, {noSvg: true});
+      xDomain, div, 0, {noSvg: true});
   div.datum({heatmap: nodeHeatMap, id: nodeId});
 
 }
@@ -569,6 +684,7 @@ function drawNetwork(network: nn.Node[][]): void {
   let idWithCallout = null;
   let targetIdWithCallout = null;
 
+  addSplitControl(30, 0);
   // Draw the input layer separately.
   let cx = RECT_SIZE / 2 + 50;
   let nodeIds = Object.keys(INPUTS);
@@ -581,10 +697,11 @@ function drawNetwork(network: nn.Node[][]): void {
 
   // Draw the intermediate layers.
   for (let layerIdx = 1; layerIdx < numLayers - 1; layerIdx++) {
-    let numNodes = network[layerIdx].length;
+    let numNodes = Math.min(MAX_NUM_DISPLAY_NEURONS, network[layerIdx].length);
     let cx = layerScale(layerIdx) + RECT_SIZE / 2;
     maxY = Math.max(maxY, nodeIndexScale(numNodes));
     addPlusMinusControl(layerScale(layerIdx), layerIdx);
+    addSplitControl(layerScale(layerIdx), layerIdx);
     for (let i = 0; i < numNodes; i++) {
       let node = network[layerIdx][i];
       let cy = nodeIndexScale(i) + RECT_SIZE / 2;
@@ -592,8 +709,8 @@ function drawNetwork(network: nn.Node[][]): void {
       drawNode(cx, cy, node.id, false, container, node);
 
       // Show callout to thumbnails.
-      let numNodes = network[layerIdx].length;
-      let nextNumNodes = network[layerIdx + 1].length;
+      let numNodes = Math.min(MAX_NUM_DISPLAY_NEURONS, network[layerIdx].length);
+      let nextNumNodes = Math.min(MAX_NUM_DISPLAY_NEURONS, network[layerIdx + 1].length);
       if (idWithCallout == null &&
           i === numNodes - 1 &&
           nextNumNodes <= numNodes) {
@@ -606,10 +723,11 @@ function drawNetwork(network: nn.Node[][]): void {
       }
 
       // Draw links.
-      for (let j = 0; j < node.inputLinks.length; j++) {
+      let numInputLinks = Math.min(MAX_NUM_DISPLAY_NEURONS, node.inputLinks.length);
+      for (let j = 0; j < numInputLinks; j++) {
         let link = node.inputLinks[j];
         let path: SVGPathElement = drawLink(link, node2coord, network,
-            container, j === 0, j, node.inputLinks.length).node() as any;
+            container, j === 0, j, numInputLinks).node() as any;
         // Show callout to weights.
         let prevLayer = network[layerIdx - 1];
         let lastNodePrevLayer = prevLayer[prevLayer.length - 1];
@@ -637,10 +755,22 @@ function drawNetwork(network: nn.Node[][]): void {
   let cy = nodeIndexScale(0) + RECT_SIZE / 2;
   node2coord[node.id] = {cx, cy};
   // Draw links.
-  for (let i = 0; i < node.inputLinks.length; i++) {
+  let numInputLinks = Math.min(MAX_NUM_DISPLAY_NEURONS, node.inputLinks.length);
+  for (let i = 0; i < numInputLinks; i++) {
     let link = node.inputLinks[i];
     drawLink(link, node2coord, network, container, i === 0, i,
-        node.inputLinks.length);
+        numInputLinks);
+  }
+  // Draw the second output node separately.
+  cx = width + RECT_SIZE / 2;
+  node = network[numLayers - 1][1];
+  cy = nodeIndexScale(0) + RECT_SIZE / 2 + 320;
+  node2coord[node.id] = {cx, cy};
+  // Draw links.
+  for (let i = 0; i < numInputLinks; i++) {
+    let link = node.inputLinks[i];
+    drawLink(link, node2coord, network, container, i === 0, i,
+        numInputLinks);
   }
   // Adjust the height of the svg.
   svg.attr("height", maxY);
@@ -670,10 +800,13 @@ function addPlusMinusControl(x: number, layerIdx: number) {
       .attr("class", "mdl-button mdl-js-button mdl-button--icon")
       .on("click", () => {
         let numNeurons = state.networkShape[i];
-        if (numNeurons >= 8) {
+        if (numNeurons >= MAX_NUM_NEURONS) {
           return;
+        } else if (numNeurons >= 8) {
+          state.networkShape[i] *= 2;
+        } else {
+          state.networkShape[i]++;
         }
-        state.networkShape[i]++;
         parametersChanged = true;
         reset();
       })
@@ -687,8 +820,11 @@ function addPlusMinusControl(x: number, layerIdx: number) {
         let numNeurons = state.networkShape[i];
         if (numNeurons <= 1) {
           return;
+        } else if (numNeurons > 8) {
+          state.networkShape[i] /= 2;
+        } else {
+          state.networkShape[i]--;
         }
-        state.networkShape[i]--;
         parametersChanged = true;
         reset();
       })
@@ -700,6 +836,23 @@ function addPlusMinusControl(x: number, layerIdx: number) {
   div.append("div").text(
     state.networkShape[i] + " neuron" + suffix
   );
+}
+
+function addSplitControl(x: number, layerIdx: number) {
+  let div = d3.select("#network").append("div")
+    .classed("plus-minus-neurons", true)
+    .style("left", `${x + 50}px`)
+    .style("top", `-40px`);
+  let firstRow = div.append("div").attr("class", `ui-numNodes${layerIdx}`);
+  firstRow.append("button")
+      .attr("class", "mdl-button mdl-js-button mdl-button--icon")
+      .on("click", () => {
+        state.splitLayerIndex = layerIdx;
+        reset();
+      })
+    .append("i")
+      .attr("class", "material-icons")
+      .text(layerIdx > state.splitLayerIndex ? "remove" : "add");
 }
 
 function updateHoverCard(type: HoverType, nodeOrLink?: nn.Node | nn.Link,
@@ -837,13 +990,25 @@ function updateDecisionBoundary(network: nn.Node[][], firstTime: boolean) {
   }
 }
 
+function getLossFunction(): nn.ErrorFunction {
+  if (state.loss === Loss.SQUARE) {
+    return nn.Errors.SQUARE;
+  } else if (state.loss === Loss.LOGISTIC) {
+    return nn.Errors.LOGISTIC;
+  } else {
+    return nn.Errors.HINGE;
+  }
+}
+
 function getLoss(network: nn.Node[][], dataPoints: Example2D[]): number {
+  let lossFunction = getLossFunction();
   let loss = 0;
   for (let i = 0; i < dataPoints.length; i++) {
     let dataPoint = dataPoints[i];
     let input = constructInput(dataPoint.x, dataPoint.y);
     let output = nn.forwardProp(network, input);
-    loss += nn.Errors.SQUARE.error(output, dataPoint.label);
+    loss += 0.5 * lossFunction.error(output[0], dataPoint.label);
+    loss += 0.5 * lossFunction.error(output[1], dataPoint.label2);
   }
   return loss / dataPoints.length;
 }
@@ -857,7 +1022,18 @@ function updateUI(firstStep = false) {
   updateDecisionBoundary(network, firstStep);
   let selectedId = selectedNodeId != null ?
       selectedNodeId : nn.getOutputNode(network).id;
-  heatMap.updateBackground(boundary[selectedId], state.discretize);
+  let selectedId2 = selectedNodeId != null ?
+      selectedNodeId : nn.getOutputNode2(network).id;
+  let boundary1 = boundary[selectedId];
+  heatMap.updateBackground(boundary1, state.discretize);
+  let boundary2 = boundary[selectedId2];
+  heatMap2.updateBackground(boundary2, state.discretize);
+  if (selectedNodeId != null) {
+    boundary1 = boundary[nn.getOutputNode(network).id];
+    boundary2 = boundary[nn.getOutputNode2(network).id];
+  }
+  let boundaryOverlap = getOverlap(boundary1, boundary2);
+  heatMapOverlap.updateBackground(boundaryOverlap, state.discretize);
 
   // Update all decision boundaries.
   d3.select("#network").selectAll("div.canvas")
@@ -907,13 +1083,14 @@ function constructInput(x: number, y: number): number[] {
 }
 
 function oneStep(): void {
+  let lossFunction = getLossFunction()
   iter++;
   trainData.forEach((point, i) => {
     let input = constructInput(point.x, point.y);
     nn.forwardProp(network, input);
-    nn.backProp(network, point.label, nn.Errors.SQUARE);
+    nn.backProp(network, point.label, point.label2, lossFunction);
     if ((i + 1) % state.batchSize === 0) {
-      nn.updateWeights(network, state.learningRate, state.regularizationRate);
+      nn.updateWeights(network, state.learningRate, state.regularizationRate, iter + 1, state.optimizer);
     }
   });
   // Compute the loss.
@@ -952,11 +1129,11 @@ function reset(onStartup=false) {
   // Make a simple network.
   iter = 0;
   let numInputs = constructInput(0 , 0).length;
-  let shape = [numInputs].concat(state.networkShape).concat([1]);
+  let shape = [numInputs].concat(state.networkShape).concat([2]);
   let outputActivation = (state.problem === Problem.REGRESSION) ?
       nn.Activations.LINEAR : nn.Activations.TANH;
   network = nn.buildNetwork(shape, state.activation, outputActivation,
-      state.regularization, constructInputIds(), state.initZero);
+      state.regularization, constructInputIds(), state.initZero, state.splitLayerIndex);
   lossTrain = getLoss(network, trainData);
   lossTest = getLoss(network, testData);
   drawNetwork(network);
@@ -1000,7 +1177,7 @@ function drawDatasetThumbnails() {
     let data = dataGenerator(200, 0);
     data.forEach(function(d) {
       context.fillStyle = colorScale(d.label);
-      context.fillRect(w * (d.x + 6) / 12, h * (d.y + 6) / 12, 4, 4);
+      context.fillRect(w * (d.x + 6) / 12, h - h * (d.y + 6) / 12, 4, 4);
     });
     d3.select(canvas.parentNode).style("display", null);
   }
@@ -1077,14 +1254,28 @@ function generateData(firstTime = false) {
   let generator = state.problem === Problem.CLASSIFICATION ?
       state.dataset : state.regDataset;
   let data = generator(numSamples, state.noise / 100);
+  // Add the second labels.
+  addLabels(data, state.secondLabel);
   // Shuffle the data in-place.
   shuffle(data);
+  allData = data;
   // Split into train and test data.
-  let splitIndex = Math.floor(data.length * state.percTrainData / 100);
-  trainData = data.slice(0, splitIndex);
-  testData = data.slice(splitIndex);
+  updateData();
+}
+
+function updateData(): void {
+  // Filter by the margin for the second label.
+  [trainData, testData] = splitData(allData, state.percTrainData, state.generalization);
+  if (state.secondLabelMargin) {
+    trainData = filterByMargin(trainData, state.secondLabel);
+    testData = filterByMargin(testData, state.secondLabel);
+  }
   heatMap.updatePoints(trainData);
+  heatMap2.updatePoints(trainData);
+  heatMapOverlap.updatePoints(trainData);
   heatMap.updateTestPoints(state.showTestData ? testData : []);
+  heatMap2.updateTestPoints(state.showTestData ? testData : []);
+  heatMapOverlap.updateTestPoints(state.showTestData ? testData : []);
 }
 
 let firstInteraction = true;

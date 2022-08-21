@@ -14,20 +14,177 @@ limitations under the License.
 ==============================================================================*/
 
 import * as d3 from 'd3';
-
+import {
+  Generalization,
+  SecondLabel
+} from "./state";
 /**
  * A two dimensional example: x and y coordinates with the label.
  */
 export type Example2D = {
   x: number,
   y: number,
-  label: number
+  label: number,
+  label2?: number
 };
 
 type Point = {
   x: number,
   y: number
 };
+
+const INPUT_SCALE = 0.8;
+const MARGIN = 0.5;
+
+function onMarginCircleLabel(p: Point): boolean {
+  let distance = dist(p, {x: 0, y: 0});
+  let threshold = 5 * 0.5;
+  return Math.abs(distance - threshold) < MARGIN;
+}
+
+function onMarginXORLabel(p: Point): boolean {
+  return Math.min(Math.abs(p.x), Math.abs(p.y)) < MARGIN;
+}
+
+function onMarginTwoGaussLabel(p: Point): boolean {
+  return Math.abs(p.x + p.y) < 0.7071 * MARGIN;
+}
+
+function onMarginVerticalLabel(p: Point): boolean {
+  return Math.abs(p.y) < MARGIN;
+}
+
+function onMarginRandomLabel(p: Point): boolean {
+  return false;
+}
+
+function onMarginSameLabel(p: Point): boolean {
+  return false;
+}
+
+function onMargin(x: number, y: number, secondLabel: number): boolean {
+  let result;
+  if (secondLabel === SecondLabel.LINEAR) {
+    result = onMarginTwoGaussLabel({x: x, y: y});
+  } else if (secondLabel === SecondLabel.CIRCLE) {
+    result = onMarginCircleLabel({x: x, y: y});
+  } else if (secondLabel === SecondLabel.XOR) {
+    result = onMarginXORLabel({x: x, y: y});
+  } else if (secondLabel === SecondLabel.VERTICAL) {
+    result = onMarginVerticalLabel({x: x, y: y});
+  } else if (secondLabel === SecondLabel.RANDOM) {
+    result = onMarginRandomLabel({x: x, y: y});
+  } else {
+    result = onMarginSameLabel({x: x, y: y});
+  }
+  return result;
+}
+
+export function filterByMargin(data: Example2D[], secondLabel:number): Example2D[] {
+  let points: Example2D[] = [];
+  for (let i = 0; i < data.length; i++) {
+    let point = data[i];
+    let invalid = onMargin(point.x, point.y, secondLabel);
+    if (!invalid) {
+      points.push(point);
+    }
+  }
+  return points;
+}
+
+function getCircleLabel(p: Point): number {
+  return (dist(p, {x: 0, y: 0}) < (5 * 0.5)) ? 1 : -1;
+}
+
+function getXORLabel(p: Point): number {
+  return p.x * p.y >= 0 ? 1 : -1;
+}
+
+function getTwoGaussLabel(p: Point): number {
+  return p.x + p.y >= 0 ? 1 : -1;
+}
+
+function getVerticalLabel(p: Point): number {
+  return p.y >= 0 ? 1 : -1;
+}
+
+function getRandomLabel(p: Point): number {
+  return Math.random() * 2 >= 1 ? 1 : -1;
+}
+
+function getSameLabel(label: number): number {
+  return label;
+}
+
+function getLabel2(x: number, y: number, secondLabel: number, label: number): number {
+  let label2;
+  if (secondLabel === SecondLabel.LINEAR) {
+    label2 = getTwoGaussLabel({x: x, y: y});
+  } else if (secondLabel === SecondLabel.CIRCLE) {
+    label2 = getCircleLabel({x: x, y: y});
+  } else if (secondLabel === SecondLabel.XOR) {
+    label2 = getXORLabel({x: x, y: y});
+  } else if (secondLabel === SecondLabel.VERTICAL) {
+    label2 = getVerticalLabel({x: x, y: y});
+  } else if (secondLabel === SecondLabel.RANDOM) {
+    label2 = getRandomLabel({x: x, y: y});
+  } else {
+    label2 = getSameLabel(label);
+  }
+  return label2;
+}
+
+export function addLabels(data: Example2D[], secondLabel:number): void {
+  for (let i = 0; i < data.length; i++) {
+    let point = data[i];
+    let label2 = getLabel2(point.x, point.y, secondLabel, point.label);
+    point.label2 = label2;
+    point.x = INPUT_SCALE * point.x
+    point.y = INPUT_SCALE * point.y
+  }
+}
+
+function filterByLabel(label1: number, label2: number, id:number): boolean {
+  let p1 = label1 > 0;
+  let p2 = label2 > 0;
+  if (id === Generalization.OOD_PP) {
+    return p1 && p2;
+  } else if (id === Generalization.OOD_PN) {
+    return p1 && !p2;
+  } else if (id === Generalization.OOD_NP) {
+    return !p1 && p2;
+  } else if (id === Generalization.OOD_NN) {
+    return !p1 && !p2;
+  }
+  return false;
+}
+
+function getIndex(length: number, perc: number): number {
+  return Math.floor(length * perc / 100)
+}
+
+function filterData(data: Example2D[], id: number, isTrain: boolean): Example2D[] {
+  let points: Example2D[] = [];
+  for (let i = 0; i < data.length; i++) {
+    let point = data[i];
+    let filters = filterByLabel(point.label, point.label2, id);
+    if (isTrain && !filters || !isTrain && filters) {
+      points.push(point);
+    }
+  }
+  return points
+}
+
+export function splitData(data: Example2D[], percTrainData:number, id: number): Example2D[][] {
+  let splitIndex = getIndex(data.length, percTrainData);
+  let trainData: Example2D[] = data.slice(0, splitIndex);
+  let testData: Example2D[] = data.slice(splitIndex);
+  if (id !== Generalization.IID) {
+    trainData = filterData(trainData, id, true)
+    testData = filterData(testData, id, false)
+  }
+  return [trainData, testData];
+}
 
 /**
  * Shuffles the array using Fisher-Yates algorithm. Uses the seedrandom
@@ -52,7 +209,7 @@ export function shuffle(array: any[]): void {
 
 export type DataGenerator = (numSamples: number, noise: number) => Example2D[];
 
-export function classifyTwoGaussData(numSamples: number, noise: number):
+function getGauss(numSamples: number, noise: number, centers: number[][]):
     Example2D[] {
   let points: Example2D[] = [];
 
@@ -66,9 +223,43 @@ export function classifyTwoGaussData(numSamples: number, noise: number):
       points.push({x, y, label});
     }
   }
+  for (let i = 0; i < centers.length; i++) {
+    let c = centers[i];
+    genGauss(c[0], c[1], c[2]);
+  }
+  return points
+}
 
-  genGauss(2, 2, 1); // Gaussian with positive examples.
-  genGauss(-2, -2, -1); // Gaussian with negative examples.
+export function classifyTwoGaussData(numSamples: number, noise: number):
+    Example2D[] {
+  let centers = [
+    [2, 2, 1], // Gaussian with positive examples.
+    [-2, -2, -1]]; // Gaussian with negative examples.
+  return getGauss(numSamples, noise, centers);
+}
+
+export function classifyHorizontalData(numSamples: number, noise: number):
+    Example2D[] {
+  let centers = [
+    [3, 3, 1], // Gaussian with positive examples.
+    [3, -3, 1],
+    [-3, 3, -1],
+    [-3, -3,-1]]; // Gaussian with negative examples.
+  return getGauss(numSamples, 0.5 * noise, centers);
+}
+
+export function classifyRandomData(numSamples: number, noise: number):
+    Example2D[] {
+  numSamples = Math.floor(numSamples / 8);
+  let points: Example2D[] = [];
+  for (let i = 0; i < numSamples; i++) {
+    let x = randUniform(-5, 5);
+    let y = randUniform(-5, 5);
+    let noiseX = randUniform(-5, 5) * noise;
+    let noiseY = randUniform(-5, 5) * noise;
+    let label = getRandomLabel({x: x + noiseX, y: y + noiseY});
+    points.push({x, y, label});
+  }
   return points;
 }
 

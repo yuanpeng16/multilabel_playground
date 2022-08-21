@@ -40,12 +40,13 @@ export class HeatMap {
   private numSamples: number;
   private color;
   private canvas;
+  private outputId;
   private svg;
 
   constructor(
       width: number, numSamples: number, xDomain: [number, number],
       yDomain: [number, number], container,
-      userSettings?: HeatMapSettings) {
+      outputId: number, userSettings?: HeatMapSettings) {
     this.numSamples = numSamples;
     let height = width;
     let padding = userSettings.showAxes ? 20 : 0;
@@ -57,6 +58,7 @@ export class HeatMap {
       }
     }
 
+    this.outputId = outputId
     this.xScale = d3.scale.linear()
       .domain(xDomain)
       .range([0, width - 2 * padding]);
@@ -200,7 +202,7 @@ export class HeatMap {
         cx: (d: Example2D) => this.xScale(d.x),
         cy: (d: Example2D) => this.yScale(d.y),
       })
-      .style("fill", d => this.color(d.label));
+      .style("fill", d => this.color(this.outputId == 0 ? d.label : d.label2));
 
     // Remove points if the length has gone down.
     selection.exit().remove();

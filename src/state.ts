@@ -39,7 +39,9 @@ export let datasets: {[key: string]: dataset.DataGenerator} = {
   "circle": dataset.classifyCircleData,
   "xor": dataset.classifyXORData,
   "gauss": dataset.classifyTwoGaussData,
+  "horizontal": dataset.classifyHorizontalData,
   "spiral": dataset.classifySpiralData,
+  "random": dataset.classifyRandomData,
 };
 
 /** A map between dataset names and functions that generate regression data. */
@@ -94,6 +96,66 @@ export let problems = {
   "regression": Problem.REGRESSION
 };
 
+export enum Loss {
+  SQUARE,
+  LOGISTIC,
+  HINGE
+}
+
+export let losses = {
+  "square": Loss.SQUARE,
+  "logistic": Loss.LOGISTIC,
+  "hinge": Loss.HINGE
+};
+
+export enum Optimizer {
+  SGD,
+  ADA_GRAD,
+  RMSPROP,
+  ADAM
+}
+
+export let optimizers = {
+  "sgd": 0, // Optimizer.SGD
+  "ada_grad": 1, // Optimizer.ADA_GRAD
+  "rmsprop": 2, // Optimizer.RMSPROP
+  "adam": 3 // Optimizer.ADAM
+};
+
+export enum Generalization {
+  IID,
+  OOD_PP,
+  OOD_PN,
+  OOD_NP,
+  OOD_NN
+}
+
+export let generalizations = {
+  "iid": Generalization.IID,
+  "ood_pp": Generalization.OOD_PP,
+  "ood_pn": Generalization.OOD_PN,
+  "ood_np": Generalization.OOD_NP,
+  "ood_nn": Generalization.OOD_NN
+};
+
+export enum SecondLabel {
+  LINEAR,
+  CIRCLE,
+  XOR,
+  VERTICAL,
+  RANDOM,
+  SAME
+}
+
+export let secondLabels = {
+  "linear": SecondLabel.LINEAR,
+  "circle": SecondLabel.CIRCLE,
+  "xor": SecondLabel.XOR,
+  "vertical": SecondLabel.VERTICAL,
+  "random": SecondLabel.RANDOM,
+  "same": SecondLabel.SAME
+};
+
 export interface Property {
   name: string;
   type: Type;
@@ -113,8 +175,10 @@ export class State {
     {name: "regularizationRate", type: Type.NUMBER},
     {name: "noise", type: Type.NUMBER},
     {name: "networkShape", type: Type.ARRAY_NUMBER},
+    {name: "splitLayerIndex", type: Type.NUMBER},
     {name: "seed", type: Type.STRING},
     {name: "showTestData", type: Type.BOOLEAN},
+    {name: "secondLabelMargin", type: Type.BOOLEAN},
     {name: "discretize", type: Type.BOOLEAN},
     {name: "percTrainData", type: Type.NUMBER},
     {name: "x", type: Type.BOOLEAN},
@@ -129,28 +193,38 @@ export class State {
     {name: "collectStats", type: Type.BOOLEAN},
     {name: "tutorial", type: Type.STRING},
     {name: "problem", type: Type.OBJECT, keyMap: problems},
+    {name: "loss", type: Type.OBJECT, keyMap: losses},
+    {name: "optimizer", type: Type.OBJECT, keyMap: optimizers},
+    {name: "generalization", type: Type.OBJECT, keyMap: generalizations},
+    {name: "secondLabel", type: Type.OBJECT, keyMap: secondLabels},
     {name: "initZero", type: Type.BOOLEAN},
     {name: "hideText", type: Type.BOOLEAN}
   ];
 
   [key: string]: any;
-  learningRate = 0.03;
+  learningRate = 0.01;
   regularizationRate = 0;
   showTestData = false;
+  secondLabelMargin = true;
   noise = 0;
   batchSize = 10;
   discretize = false;
   tutorial: string = null;
   percTrainData = 50;
-  activation = nn.Activations.TANH;
+  activation = nn.Activations.RELU;
   regularization: nn.RegularizationFunction = null;
   problem = Problem.CLASSIFICATION;
+  loss = Loss.SQUARE;
+  optimizer = Optimizer.ADAM;
+  generalization = Generalization.OOD_PP;
+  secondLabel = SecondLabel.LINEAR;
   initZero = false;
   hideText = false;
   collectStats = false;
   numHiddenLayers = 1;
   hiddenLayerControls: any[] = [];
-  networkShape: number[] = [4, 2];
+  networkShape: number[] = [8, 8, 8, 8, 8, 8];
+  splitLayerIndex: number = this.networkShape.length;
   x = true;
   y = true;
   xTimesY = false;
